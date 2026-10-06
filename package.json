@@ -1,0 +1,15 @@
+{
+  "name": "guide-studio",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "setup": "playwright install chromium",
+    "start": "node  --env-file-if-exists=.env server.js"
+  },
+  "dependencies": {
+    "docx": "^9.5.0",
+    "jszip": "^3.10.1",
+    "pdf-lib": "^1.17.1",
+    "playwright": "^1.52.0"
+  }
+}
