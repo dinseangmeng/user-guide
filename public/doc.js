@@ -182,6 +182,21 @@ async function loadDoc() {
   if (S.view === 'doc') renderBody();
 }
 
+// Pull the document structure again after something else (the assistant) changed it,
+// without throwing away what the author is typing in the cover form.
+async function refreshDocFromServer() {
+  if (!S.project || !S.userId || !S.doc) return;
+  const pid = S.project.id;
+  const uid = S.userId;
+  const d = await api('GET', base() + '/document');
+  if (!S.project || pid !== S.project.id || uid !== S.userId || !S.doc) return;
+  const typing = document.activeElement && document.activeElement.closest && document.activeElement.closest('#docform');
+  S.doc = { ...d, settings: typing ? S.doc.settings : d.settings };
+  if (S.view !== 'doc' || S.dragging || S.nodeDrag) return;
+  if (typing) renderTree();
+  else renderBody();
+}
+
 async function refreshOutputs() {
   const d = await api('GET', base() + '/document');
   if (!S.doc) return;

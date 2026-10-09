@@ -15,6 +15,8 @@ const S = {
   lang: 'en',
   draftAfter: true,
   exploreAfter: true,
+  superviseAfter: true,
+  chat: null,
   modal: null,
   view: 'review',
   doc: null,
@@ -34,6 +36,8 @@ const JOB_LABEL = {
   capture: 'Re-shooting a page',
   explore: 'Exploring clicks',
   restart: 'Starting over',
+  supervise: 'Supervisor checking',
+  agent: 'Assistant working',
   'add-page': 'Capturing a new page',
   generate: 'Building documents',
 };
@@ -122,6 +126,7 @@ function renderSide() {
 }
 
 function renderHead() {
+  setTimeout(renderChat, 0);
   if (!S.project) {
     $('head').innerHTML =
       '<div class="empty"><h2>Welcome to Guide Studio</h2><p>Create a project for each web app, add the users you want guides for, then discover and review their pages.</p><button class="btn primary" data-act="new-project">Create your first project</button></div>';
@@ -129,11 +134,15 @@ function renderHead() {
   }
   const p = S.project;
   const tabs = p.users
-    .map((u) => '<button class="tab ' + (u.id === S.userId ? 'active' : '') + '" data-act="select-user" data-id="' + esc(u.id) + '">' + esc(u.name) + '</button>')
+    .map(
+      (u) =>
+        '<span class="tabwrap ' + (u.id === S.userId ? 'active' : '') + '"><button class="tab ' + (u.id === S.userId ? 'active' : '') + '" data-act="select-user" data-id="' + esc(u.id) + '">' + esc(u.name) +
+        '</button><button class="tab-edit" data-act="edit-user" data-id="' + esc(u.id) + '" title="Edit ' + esc(u.name) + ' (name, login, password, delete)">✎</button></span>'
+    )
     .join('');
   $('head').innerHTML =
     '<div class="phead"><div><h1>' + esc(p.name) + '</h1><div class="muted">' + esc(p.appUrl) +
-    '</div></div><div class="trow"><button class="btn" data-act="edit-vars">Shared variables</button><button class="btn" data-act="edit-project">Project settings</button></div></div><div class="tabs">' +
+    '</div></div><div class="trow"><button class="btn" data-act="edit-vars">Shared variables</button><button class="btn" data-act="edit-project">Project settings</button><button class="btn bad" data-act="delete-project">Delete project</button></div></div><div class="tabs">' +
     tabs + '<button class="tab add" data-act="add-user">+ Add user</button></div>';
 }
 
@@ -171,6 +180,8 @@ function renderToolbar() {
     '<button class="btn primary" data-act="discover"' + (hasActive('discover') ? ' disabled' : '') + '>Discover pages</button>' +
     '<label class="chk"><input type="checkbox" id="draft-after" ' + (S.draftAfter ? 'checked' : '') + '> Draft with AI</label>' +
     '<label class="chk"><input type="checkbox" id="explore-after" ' + (S.exploreAfter ? 'checked' : '') + '> Explore clicks</label>' +
+    '<label class="chk"><input type="checkbox" id="supervise-after" ' + (S.superviseAfter ? 'checked' : '') + '> Supervisor auto</label>' +
+    '<button class="btn" data-act="supervise"' + aiOff + (hasActive('supervise') ? ' disabled' : '') + '>Run supervisor</button>' +
     '<button class="btn" data-act="draft-new"' + aiOff + '>Draft new</button>' +
     '<button class="btn" data-act="draft-all"' + aiOff + '>Redraft unapproved</button>' +
     '<button class="btn" data-act="add-page">+ Add page</button>' +
@@ -197,12 +208,19 @@ function renderJobbar() {
       '<div class="jobline fail"><span class="txt"><b>' + esc(JOB_LABEL[failed.type] || failed.type) + ' failed:</b> ' + esc(failed.error) +
       '</span><button class="btn sm" data-act="show-log">Log</button></div>';
   }
+  if (!html && S.guide && S.guide.supervisorRun && S.guide.supervisorRun.summary) {
+    const r = S.guide.supervisorRun;
+    html = '<div class="jobline calm"><span class="txt"><b>Supervisor</b> · ' + esc(new Date(r.at).toLocaleTimeString()) + ' · ' + esc(r.summary) + '</span></div>';
+  }
   $('jobbar').innerHTML = html;
 }
 
+const supOn = () => S.superviseAfter && !!S.config.ready;
+
 function statusLabel(f) {
   if (!f.capturedAt && f.missingParams.length) return 'Needs values';
-  return { new: 'New', draft: 'Draft', approved: 'Approved', rejected: 'Rejected' }[f.status] || f.status;
+  const label = { new: 'New', draft: 'Draft', approved: 'Approved', rejected: 'Rejected' }[f.status] || f.status;
+  return f.statusBy === 'supervisor' ? label + ' (auto)' : label;
 }
 
 function cardHtml(f) {
@@ -233,7 +251,8 @@ function cardHtml(f) {
   const notes =
     (f.capturedAt && f.error ? '<div class="note bad">' + esc(f.error) + '</div>' : '') +
     (f.trigger ? '<div class="note info">State after clicking “' + esc(f.trigger.label) + '”</div>' : '') +
-    (f.review && f.review.notes ? '<div class="note info">Supervisor (' + esc(f.review.verdict) + '): ' + esc(f.review.notes) + '</div>' : '') +
+    (f.supervisor && f.supervisor.reason ? '<div class="note sup">Supervisor: <b>' + esc(f.supervisor.decision) + '</b> – ' + esc(f.supervisor.reason) + '</div>' : '') +
+    (f.review && f.review.notes ? '<div class="note info">Reviewer (' + esc(f.review.verdict) + '): ' + esc(f.review.notes) + '</div>' : '') +
     (f.missingParams.length ? '<div class="note">Needs a sample value for: ' + esc(f.missingParams.join(', ')) + '. Click Edit to set it.</div>' : '');
   const handle = S.filter === 'all' ? '<span class="drag" title="Drag to reorder">⠿</span>' : '';
   const off = f.busy ? ' disabled' : '';
@@ -292,41 +311,74 @@ function renderAll() {
   renderBody();
 }
 
-function paramsHtml(route, params) {
+// Copy of heuristicRef() in lib/routes.js: keep them in sync.
+const GENERIC_PARAMS = ['id', 'uid', 'uuid', 'pk', 'key', 'slug', 'code', 'no', 'number', 'ref'];
+const ROUTE_VERBS = ['view', 'views', 'edit', 'detail', 'details', 'show', 'update', 'create', 'new', 'add', 'delete', 'remove', 'list', 'info', 'manage', 'form', 'page'];
+
+function singularWord(w) {
+  if (/ies$/.test(w) && w.length > 4) return w.slice(0, -3) + 'y';
+  if (/(ses|xes|ches|shes)$/.test(w)) return w.slice(0, -2);
+  if (/s$/.test(w) && !/ss$/.test(w) && w.length > 3) return w.slice(0, -1);
+  return w;
+}
+
+function heuristicRef(route, name) {
+  if (!GENERIC_PARAMS.includes(name.toLowerCase())) return name;
+  const segs = String(route || '').split('?')[0].split('/').filter(Boolean);
+  const at = segs.findIndex((s) => new RegExp('^:' + name + '(\\(|\\?|$)').test(s));
+  for (let i = (at < 0 ? segs.length : at) - 1; i >= 0; i--) {
+    const s = segs[i].toLowerCase();
+    if (s.startsWith(':') || ROUTE_VERBS.includes(s)) continue;
+    const word = singularWord(s.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, ''));
+    if (word) return word + '_' + name.toLowerCase();
+  }
+  return name;
+}
+
+// withRefs: show an editable "shared name" per value (page edit dialog only).
+function paramsHtml(route, params, alias, withRefs) {
   const shared = (S.project && S.project.variables) || {};
   return paramNames(route)
     .map((n) => {
-      const ph = shared[n] ? 'shared value: ' + shared[n] : 'e.g. 12';
+      const ref = (alias && alias[n]) || heuristicRef(route, n);
+      const sv = shared[ref] != null && shared[ref] !== '' ? shared[ref] : shared[n];
+      const ph = sv ? 'shared value: ' + sv : 'e.g. 12';
+      const note = sv ? ' <span class="muted">(blank = shared ' + esc(ref) + ')</span>' : ref !== n ? ' <span class="muted">(shared as ' + esc(ref) + ')</span>' : '';
       return (
-        '<label>Value for <code>:' + esc(n) + '</code>' + (shared[n] ? ' <span class="muted">(blank = shared)</span>' : '') +
-        '<input type="text" name="param:' + esc(n) + '" value="' + esc((params && params[n]) || '') + '" placeholder="' + esc(ph) + '"></label>'
+        '<label>Value for <code>:' + esc(n) + '</code>' + note +
+        '<input type="text" name="param:' + esc(n) + '" value="' + esc((params && params[n]) || '') + '" placeholder="' + esc(ph) + '"></label>' +
+        (withRefs ? '<label>Shared name for <code>:' + esc(n) + '</code> <span class="muted">(pages with the same name share one value)</span><input type="text" name="ref:' + esc(n) + '" value="' + esc(ref) + '"></label>' : '')
       );
     })
     .join('');
 }
 
-function varNames() {
-  const names = new Map();
-  Object.keys((S.project && S.project.variables) || {}).forEach((k) => names.set(k, 0));
+function varRefs() {
+  const m = new Map();
+  Object.keys((S.project && S.project.variables) || {}).forEach((k) => m.set(k, []));
   ((S.guide && S.guide.features) || []).forEach((f) => {
-    paramNames(f.route).forEach((n) => names.set(n, (names.get(n) || 0) + 1));
+    (f.paramRefs || []).forEach((r) => {
+      if (!m.has(r.ref)) m.set(r.ref, []);
+      const list = m.get(r.ref);
+      if (!list.includes(f.route)) list.push(f.route);
+    });
   });
-  return [...names.entries()];
+  return [...m.entries()];
 }
 
 function varsModalHtml(m) {
-  const rows = varNames()
+  const rows = varRefs()
     .map(
-      ([n, count]) =>
-        '<label>:' + esc(n) + ' <span class="muted">(' + (count ? 'used by ' + count + ' page' + (count === 1 ? '' : 's') : 'not used yet') + ')</span>' +
-        '<input type="text" name="var:' + esc(n) + '" value="' + esc(m.data[n] || '') + '" placeholder="not set"></label>'
+      ([ref, routes]) =>
+        '<label><code>' + esc(ref) + '</code> <span class="muted">(' + (routes.length ? esc(routes.slice(0, 3).join(', ')) + (routes.length > 3 ? ' +' + (routes.length - 3) : '') : 'not used yet') + ')</span>' +
+        '<input type="text" name="var:' + esc(ref) + '" value="' + esc(m.data[ref] || '') + '" placeholder="not set"></label>'
     )
     .join('');
   return (
     '<div class="backdrop"><div class="dialog"><h2>Shared variables</h2><form id="modal-form" autocomplete="off">' +
-    '<p class="muted">Set a value once and every page whose route contains it (for example <code>/departments/:department</code>) uses it. A value typed on a single page (Edit) still wins for that page. Applies to all users in this project.</p>' +
+    '<p class="muted">Each name is shared by the pages that use it. The supervisor gives route values unique names, so <code>/user/view/:id</code> becomes <code>user_id</code> and <code>/product/view/:id</code> becomes <code>product_id</code>, while the real URL keeps <code>:id</code>. A value typed on a single page (Edit) still wins for that page. Applies to all users in this project.</p>' +
     '<div class="stack">' + (rows || '<p class="muted">No pages use a <code>:variable</code> yet. You can add one below.</p>') + '</div>' +
-    '<div class="form" style="margin-top:10px"><label>Add variable name<input type="text" name="newname" placeholder="department"></label>' +
+    '<div class="form" style="margin-top:10px"><label>Add variable name<input type="text" name="newname" placeholder="department_id"></label>' +
     '<label>Value<input type="text" name="newvalue" placeholder="e.g. 12"></label></div>' +
     '<div class="mfoot"><span class="grow"></span><button type="button" class="btn" data-act="close">Cancel</button>' +
     '<button type="button" class="btn primary" data-act="save-vars">Save</button></div></form></div></div>'
@@ -345,6 +397,7 @@ function projectModalHtml(m) {
     '<label>Username field selector<input type="text" name="userSelector" value="' + esc(d.userSelector) + '"></label>' +
     '<label>Password field selector<input type="text" name="passSelector" value="' + esc(d.passSelector) + '"></label>' +
     '<label class="full">Login button selector<input type="text" name="submitSelector" value="' + esc(d.submitSelector) + '"></label>' +
+    '<div class="full"><button type="button" class="btn" data-act="detect-login">Auto-detect login fields</button> <span class="muted">Opens the login page and finds the username, password and button for you.</span></div>' +
     '<label class="full">About this app (helps the AI write better text)<textarea name="context" rows="2">' + esc(d.context) + '</textarea></label></div>' +
     '<div class="mfoot">' + (edit ? '<button type="button" class="btn danger" data-act="delete-project">Delete project</button><span class="grow"></span>' : '') +
     '<button type="button" class="btn" data-act="close">Cancel</button><button type="button" class="btn primary" data-act="save-project">' + (edit ? 'Save' : 'Create') + '</button></div></form></div></div>'
@@ -404,7 +457,7 @@ function editModalHtml(m) {
     '<label>Name (KM)<input type="text" name="name_km" value="' + esc(d.name.km) + '"></label>' +
     '<label>Route<input type="text" name="route" value="' + esc(d.route) + '"></label>' +
     '<label>Wait for this selector before the screenshot (optional)<input type="text" name="waitFor" value="' + esc(d.waitFor) + '"></label>' +
-    '<div class="full stack" id="params-box" style="margin-top:0">' + paramsHtml(d.route, d.params) + '</div>' +
+    '<div class="full stack" id="params-box" style="margin-top:0">' + paramsHtml(d.route, d.params, d.refs || d.alias, true) + '</div>' +
     '<label class="full">Click these selectors first, one per line (optional, to open a tab or dialog)<textarea name="steps" rows="2">' + esc(d.stepsText) + '</textarea></label></div>' +
     '<h3>Callouts</h3><div id="items-box">' + itemsHtml(d.items) + '</div>' +
     '<div class="addrow"><select id="add-el"><option value="">Add an element from the screenshot…</option>' + options + '</select>' +
@@ -450,10 +503,11 @@ function closeModal() {
 
 function formObject() {
   const form = $('modal-form');
-  const out = { params: {} };
+  const out = { params: {}, refs: {} };
   if (!form) return out;
   for (const [k, v] of new FormData(form).entries()) {
     if (k.startsWith('param:')) out.params[k.slice(6)] = v;
+    else if (k.startsWith('ref:')) out.refs[k.slice(4)] = v;
     else out[k] = v;
   }
   return out;
@@ -469,6 +523,7 @@ function syncModal() {
     m.data.waitFor = d.waitFor || '';
     m.data.stepsText = d.steps || '';
     m.data.params = d.params;
+    m.data.refs = Object.keys(d.refs).length ? d.refs : m.data.refs;
     document.querySelectorAll('#items-box .irow').forEach((row) => {
       const it = m.data.items[Number(row.dataset.i)];
       if (!it) return;
@@ -601,6 +656,8 @@ async function openEdit(id) {
       name: { en: f.name.en || '', km: f.name.km || '' },
       route: f.route,
       params: { ...f.params },
+      alias: { ...(f.alias || {}) },
+      refs: Object.fromEntries((f.paramRefs || []).map((r) => [r.name, r.ref])),
       waitFor: f.waitFor || '',
       stepsText: (f.actions || []).map((a) => a.click).join('\n'),
       items: JSON.parse(JSON.stringify(f.items)),
@@ -627,6 +684,11 @@ async function saveEdit(recapture) {
     name: d.name,
     route: d.route.trim(),
     params: d.params,
+    alias: Object.fromEntries(
+      Object.entries(d.refs || {})
+        .map(([n, v]) => [n, String(v).trim().toLowerCase()])
+        .filter(([n, v]) => v && v !== heuristicRef(d.route, n))
+    ),
     waitFor: d.waitFor.trim(),
     steps: d.stepsText.split('\n').map((s) => s.trim()).filter(Boolean),
     items: d.items,
@@ -646,6 +708,216 @@ function moveItem(i, delta) {
   renderModal(false);
 }
 
+// ---- supervisor assistant panel ---------------------------------------------
+
+const CHAT_TIPS = [
+  'Check every page and fix problems',
+  'Approve the good drafts',
+  'Which pages failed and why?',
+  'Organize the document into sections',
+];
+
+let chatTimer = null;
+
+function chatState() {
+  if (!S.chat || S.chat.uid !== S.userId) {
+    stopChatPoll();
+    S.chat = { uid: S.userId, open: S.chat ? S.chat.open : false, entries: [], running: false, sending: false, draft: '', showSteps: true, error: '', loaded: false };
+  }
+  return S.chat;
+}
+
+function chatTurns(entries) {
+  const turns = [];
+  let cur = null;
+  entries.forEach((e) => {
+    if (e.role === 'user') {
+      cur = { user: e, steps: [], confirms: [], answer: null };
+      turns.push(cur);
+      return;
+    }
+    if (!cur) {
+      cur = { user: null, steps: [], confirms: [], answer: null };
+      turns.push(cur);
+    }
+    if (e.role === 'assistant') cur.answer = e;
+    else if (e.role === 'confirm') cur.confirms.push(e);
+    else cur.steps.push(e);
+  });
+  return turns;
+}
+
+function chatBodyHtml(c) {
+  const turns = chatTurns(c.entries);
+  if (!turns.length) {
+    return (
+      '<div class="cintro">Tell the assistant what you want. It plans the work, sends jobs to the capture, writer and explorer agents, checks the results by reading and looking at the pages, and reports back.<ul>' +
+      '<li>“Check every page and fix problems”</li><li>“Why did the product pages fail?”</li><li>“Set department_id to 5 and re-shoot those pages”</li><li>“Group the approved pages into chapters and write the overview”</li></ul></div>' +
+      '<div class="ctips">' + CHAT_TIPS.map((t) => '<button class="btn sm" data-act="chat-tip" data-t="' + esc(t) + '">' + esc(t) + '</button>').join('') + '</div>'
+    );
+  }
+  return turns
+    .map((t, i) => {
+      const last = i === turns.length - 1;
+      const steps = c.showSteps && t.steps.length
+        ? '<div class="csteps">' +
+          t.steps.map((s) => '<div class="cstep' + (s.text.startsWith('→') ? ' result' : '') + (s.role === 'error' ? ' error' : '') + (!s.tool && s.role === 'step' ? ' note' : '') + '">' + esc(s.text) + '</div>').join('') + '</div>'
+        : '';
+      const confirms = t.confirms
+        .map((e) =>
+          e.resolved
+            ? '<div class="cpend done">' + esc(e.text) + ' · ' + esc(e.resolved) + '</div>'
+            : '<div class="cpend"><span>' + esc(e.text) + '</span><button class="btn sm bad" data-act="chat-confirm" data-id="' + esc(e.id) + '">Confirm</button><button class="btn sm" data-act="chat-cancel" data-id="' + esc(e.id) + '">Cancel</button></div>'
+        )
+        .join('');
+      const working = !t.answer && last && c.running ? '<div class="cworking"><span class="spin"></span> Working… ' + t.steps.filter((s) => s.tool && !s.text.startsWith('→')).length + ' step(s)</div>' : '';
+      return (
+        '<div class="cturn">' + (t.user ? '<div class="cmsg user">' + esc(t.user.text) + '</div>' : '') + steps + confirms +
+        (t.answer ? '<div class="cmsg bot' + (/^I could not finish/.test(t.answer.text) ? ' err' : '') + '">' + esc(t.answer.text) + '</div>' : working) + '</div>'
+      );
+    })
+    .join('');
+}
+
+function renderChatBody() {
+  const el = $('chat-body');
+  if (!el) return;
+  const c = chatState();
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  el.innerHTML = chatBodyHtml(c);
+  if (nearBottom) el.scrollTop = el.scrollHeight;
+}
+
+function renderChat() {
+  const box = $('chat');
+  if (!box) return;
+  if (!S.project || !S.userId) {
+    box.innerHTML = '';
+    document.body.classList.remove('assistant-open');
+    return;
+  }
+  const c = chatState();
+  document.body.classList.toggle('assistant-open', c.open);
+  if (!c.open) {
+    box.innerHTML = '<button class="chat-fab" data-act="chat-toggle" title="Talk to the supervisor">' + (c.running ? '<span class="spin"></span> Working…' : '✦ Assistant') + '</button>';
+    return;
+  }
+  const off = S.config.ready ? '' : '<div class="note">AI is off. Set ALLOW_CLOUD_AI=true and OPENROUTER_API_KEY in .env to use the assistant.</div>';
+  box.innerHTML =
+    '<aside class="assistant"><header><div><h2>✦ Assistant</h2><div class="muted small">Supervisor: ' + esc(S.config.supervisorModel || '…') + '</div></div><span class="grow"></span>' +
+    '<label class="chk small"><input type="checkbox" id="chat-steps" ' + (c.showSteps ? 'checked' : '') + '> Steps</label>' +
+    '<button class="btn sm" data-act="chat-clear"' + (c.running ? ' disabled' : '') + ' title="Clear conversation">Clear</button>' +
+    '<button class="btn sm" data-act="chat-toggle">✕</button></header>' + off +
+    '<div class="cmsgs" id="chat-body"></div>' +
+    '<footer>' + (c.error ? '<div class="note bad">' + esc(c.error) + '</div>' : '') +
+    '<div class="cform"><textarea id="chat-input" rows="2" placeholder="Ask the assistant… (Enter to send, Shift+Enter for a new line)"' + (S.config.ready ? '' : ' disabled') + '>' + esc(c.draft) + '</textarea>' +
+    (c.running
+      ? '<button class="btn bad" data-act="chat-stop">■ Stop</button>'
+      : '<button class="btn primary" data-act="chat-send"' + (c.sending || !S.config.ready ? ' disabled' : '') + '>Send</button>') +
+    '</div></footer></aside>';
+  const el = $('chat-body');
+  el.innerHTML = chatBodyHtml(c);
+  el.scrollTop = el.scrollHeight;
+  if (!c.loaded) loadChat();
+  const input = $('chat-input');
+  if (input && !c.running) input.focus();
+}
+
+async function loadChat() {
+  const c = chatState();
+  c.loaded = true;
+  try {
+    const r = await api('GET', base() + '/assistant');
+    c.entries = r.transcript;
+    c.running = r.running;
+    if (r.running) startChatPoll();
+    renderChat();
+  } catch (err) {
+    c.error = err.message;
+  }
+}
+
+function stopChatPoll() {
+  if (chatTimer) clearInterval(chatTimer);
+  chatTimer = null;
+}
+
+function startChatPoll() {
+  if (chatTimer) return;
+  const uid = S.userId;
+  chatTimer = setInterval(async () => {
+    const c = chatState();
+    if (c.uid !== uid) return stopChatPoll();
+    try {
+      const r = await api('GET', base() + '/assistant');
+      const grew = r.transcript.length !== c.entries.length;
+      c.entries = r.transcript;
+      const wasRunning = c.running;
+      c.running = r.running;
+      renderChatBody();
+      if (grew && S.view === 'doc') refreshDocFromServer().catch(() => {});
+      if (wasRunning && !r.running) {
+        stopChatPoll();
+        renderChat();
+        await loadGuide(true);
+        await refreshDocFromServer().catch(() => {});
+        await tick();
+      }
+    } catch (err) {
+      c.error = err.message;
+    }
+  }, 1200);
+}
+
+async function chatSend(text) {
+  const c = chatState();
+  text = String(text || '').trim();
+  if (!text || c.running || c.sending) return;
+  c.error = '';
+  c.sending = true;
+  try {
+    await api('POST', base() + '/assistant', { message: text });
+    c.entries.push({ role: 'user', text, at: new Date().toISOString() });
+    c.running = true;
+    c.draft = '';
+    startChatPoll();
+  } catch (err) {
+    c.error = err.message;
+  } finally {
+    c.sending = false;
+  }
+  renderChat();
+}
+
+async function chatStop() {
+  await api('POST', base() + '/assistant/stop', {}).catch(() => {});
+}
+
+async function chatClear() {
+  if (!confirm('Clear the conversation? The assistant forgets earlier messages (the guide itself is not changed).')) return;
+  await api('POST', base() + '/assistant/clear', {});
+  const c = chatState();
+  c.entries = [];
+  renderChat();
+}
+
+async function chatConfirm(entryId, yes) {
+  const c = chatState();
+  try {
+    await api('POST', base() + '/assistant/confirm', { entryId, yes });
+  } catch (err) {
+    c.error = err.message;
+  }
+  const r = await api('GET', base() + '/assistant');
+  c.entries = r.transcript;
+  c.running = r.running;
+  if (r.running) startChatPoll();
+  renderChat();
+  await loadGuide(true);
+  await refreshDocFromServer().catch(() => {});
+  await tick();
+}
+
 async function onAction(act, el) {
   const id = el.dataset.id;
   switch (act) {
@@ -656,6 +928,55 @@ async function onAction(act, el) {
     case 'edit-project':
       S.modal = { type: 'project', mode: 'edit', data: { ...S.project, context: S.project.context || '' } };
       renderModal(true);
+      break;
+    case 'supervise':
+      await api('POST', base() + '/supervise', {});
+      await tick();
+      break;
+    case 'detect-login': {
+      const d = formObject();
+      toast('Looking for the login fields…');
+      const r = await api('POST', '/api/detect-login', { appUrl: d.appUrl, loginPath: d.loginPath });
+      S.modal.data = {
+        ...S.modal.data,
+        name: d.name,
+        appUrl: d.appUrl,
+        loginPath: d.loginPath,
+        context: d.context,
+        viewport: { width: Number(d.width) || 1440, height: Number(d.height) || 900 },
+        userSelector: r.userSelector,
+        passSelector: r.passSelector,
+        submitSelector: r.submitSelector,
+      };
+      renderModal(false);
+      toast('Login fields found (' + r.via + '). Check them and Save.', 'good');
+      break;
+    }
+    case 'chat-toggle': {
+      const c = chatState();
+      c.open = !c.open;
+      renderChat();
+      break;
+    }
+    case 'chat-send': {
+      const input = $('chat-input');
+      await chatSend(input ? input.value : '');
+      break;
+    }
+    case 'chat-tip':
+      await chatSend(el.dataset.t);
+      break;
+    case 'chat-confirm':
+      await chatConfirm(el.dataset.id, true);
+      break;
+    case 'chat-cancel':
+      await chatConfirm(el.dataset.id, false);
+      break;
+    case 'chat-stop':
+      await chatStop();
+      break;
+    case 'chat-clear':
+      await chatClear();
       break;
     case 'edit-vars':
       S.modal = { type: 'vars', data: { ...(S.project.variables || {}) } };
@@ -688,8 +1009,10 @@ async function onAction(act, el) {
       renderModal(true);
       break;
     case 'edit-user': {
-      const u = S.project.users.find((x) => x.id === S.userId);
-      S.modal = { type: 'user', mode: 'edit', data: { name: u.name, username: u.username } };
+      const uid = el.dataset.id || S.userId;
+      const u = S.project.users.find((x) => x.id === uid);
+      if (!u) break;
+      S.modal = { type: 'user', mode: 'edit', userId: uid, data: { name: u.name, username: u.username } };
       renderModal(true);
       break;
     }
@@ -714,7 +1037,12 @@ async function onAction(act, el) {
       break;
     }
     case 'delete-project': {
-      if (!confirm('Delete project "' + S.project.name + '" and all its screenshots?')) break;
+      const typed = prompt('This permanently deletes the project "' + S.project.name + '", its ' + S.project.users.length + ' user(s), all screenshots and generated documents.\n\nType the project name to confirm:');
+      if (typed === null) break;
+      if (typed.trim() !== S.project.name) {
+        toast('Name did not match, project not deleted', 'bad');
+        break;
+      }
       await api('DELETE', '/api/projects/' + S.project.id);
       closeModal();
       S.project = null;
@@ -728,8 +1056,10 @@ async function onAction(act, el) {
     case 'save-user': {
       const d = formObject();
       if (S.modal.mode === 'edit') {
-        await api('PUT', '/api/projects/' + S.project.id + '/users/' + S.userId, { name: d.name, username: d.username, password: d.password });
+        const uid = S.modal.userId || S.userId;
+        await api('PUT', '/api/projects/' + S.project.id + '/users/' + uid, { name: d.name, username: d.username, password: d.password });
         closeModal();
+        await loadProjects();
         await selectProject(S.project.id, S.userId);
       } else {
         const r = await api('POST', '/api/projects/' + S.project.id + '/users', { name: d.name, username: d.username, password: d.password });
@@ -740,11 +1070,13 @@ async function onAction(act, el) {
       break;
     }
     case 'delete-user': {
-      if (!confirm('Delete this user and their guide?')) break;
-      await api('DELETE', '/api/projects/' + S.project.id + '/users/' + S.userId);
+      const uid = (S.modal && S.modal.userId) || S.userId;
+      const du = S.project.users.find((x) => x.id === uid);
+      if (!confirm('Delete user "' + (du ? du.name : '') + '" and their whole guide (pages, screenshots, documents)? This cannot be undone.')) break;
+      await api('DELETE', '/api/projects/' + S.project.id + '/users/' + uid);
       closeModal();
       await loadProjects();
-      await selectProject(S.project.id);
+      await selectProject(S.project.id, uid === S.userId ? undefined : S.userId);
       break;
     }
     case 'filter':
@@ -756,15 +1088,15 @@ async function onAction(act, el) {
       renderBody();
       break;
     case 'discover':
-      await api('POST', base() + '/discover', { draft: S.draftAfter && !!S.config.ready, explore: S.exploreAfter && !!S.config.ready });
+      await api('POST', base() + '/discover', { draft: S.draftAfter && !!S.config.ready, explore: S.exploreAfter && !!S.config.ready, supervise: supOn() });
       await tick();
       break;
     case 'draft-new':
-      await api('POST', base() + '/draft-all', { scope: 'new' });
+      await api('POST', base() + '/draft-all', { scope: 'new', supervise: supOn() });
       await tick();
       break;
     case 'draft-all':
-      await api('POST', base() + '/draft-all', { scope: 'all' });
+      await api('POST', base() + '/draft-all', { scope: 'all', supervise: supOn() });
       await tick();
       break;
     case 'approve-all': {
@@ -783,7 +1115,7 @@ async function onAction(act, el) {
       break;
     case 'save-feature': {
       const d = formObject();
-      await api('POST', base() + '/features', { route: (d.route || '').trim(), name: d.name_en, params: d.params, draft: d.draft === 'on' });
+      await api('POST', base() + '/features', { route: (d.route || '').trim(), name: d.name_en, params: d.params, draft: d.draft === 'on', supervise: supOn() });
       closeModal();
       await loadGuide(true);
       await tick();
@@ -804,7 +1136,7 @@ async function onAction(act, el) {
       await openEdit(id);
       break;
     case 'reshoot':
-      await api('POST', base() + '/features/' + id + '/recapture', { draft: false });
+      await api('POST', base() + '/features/' + id + '/recapture', { draft: false, supervise: false });
       await loadGuide(true);
       await tick();
       break;
@@ -821,13 +1153,13 @@ async function onAction(act, el) {
         '.\n\nYour cover settings and already generated PDF/Word files are kept. This cannot be undone.';
       if (!confirm(msg)) break;
       S.doc = null;
-      await api('POST', base() + '/restart', { confirm: true, draft: S.draftAfter && !!ai, explore: S.exploreAfter && !!ai });
+      await api('POST', base() + '/restart', { confirm: true, draft: S.draftAfter && !!ai, explore: S.exploreAfter && !!ai, supervise: supOn() });
       await loadGuide(true);
       await tick();
       break;
     }
     case 'redraft':
-      await api('POST', base() + '/features/' + id + '/recapture', { draft: true });
+      await api('POST', base() + '/features/' + id + '/recapture', { draft: true, supervise: supOn() });
       await loadGuide(true);
       await tick();
       break;
@@ -891,6 +1223,15 @@ document.addEventListener('submit', (e) => {
 });
 
 document.addEventListener('change', (e) => {
+  if (e.target.id === 'chat-steps') {
+    chatState().showSteps = e.target.checked;
+    renderChatBody();
+    return;
+  }
+  if (e.target.id === 'supervise-after') {
+    S.superviseAfter = e.target.checked;
+    return;
+  }
   if (e.target.id === 'explore-after') {
     S.exploreAfter = e.target.checked;
     return;
@@ -908,9 +1249,21 @@ document.addEventListener('input', (e) => {
   if (!box) return;
   const current = {};
   box.querySelectorAll('input').forEach((i) => {
-    current[i.name.slice(6)] = i.value;
+    if (i.name.startsWith('param:')) current[i.name.slice(6)] = i.value;
   });
-  box.innerHTML = paramsHtml(e.target.value, { ...S.modal.data.params, ...current });
+  const withRefs = S.modal.type === 'edit';
+  box.innerHTML = paramsHtml(e.target.value, { ...S.modal.data.params, ...current }, null, withRefs);
+});
+
+document.addEventListener('input', (e) => {
+  if (e.target.id === 'chat-input') chatState().draft = e.target.value;
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.target.id === 'chat-input' && e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    guard(() => chatSend(e.target.value));
+  }
 });
 
 const gridEl = $('grid');

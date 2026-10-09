@@ -6,6 +6,9 @@ const jobs = require('./lib/jobs');
 const ai = require('./lib/ai');
 const pipeline = require('./lib/pipeline');
 const docstore = require('./lib/docstore');
+const supervisor = require('./lib/supervisor');
+const agent = require('./lib/agent');
+const capture = require('./lib/capture');
 
 const PUBLIC = path.join(__dirname, 'public');
 const PORT = Number(process.env.PORT) || 4000;
@@ -80,22 +83,7 @@ function needFeature(pid, uid, fid) {
   return f;
 }
 
-function queueFeature(pid, uid, fid, type, opts) {
-  jobs.setBusy(uid, fid, true);
-  return jobs.enqueue({
-    type,
-    pid,
-    uid,
-    fid,
-    run: async (log) => {
-      try {
-        await pipeline.featureJob(pid, uid, fid, opts, log);
-      } finally {
-        jobs.setBusy(uid, fid, false);
-      }
-    },
-  });
-}
+const queueFeature = pipeline.queueFeature;
 
 const U = '/api/projects/:pid/users/:uid';
 
@@ -158,7 +146,7 @@ route('POST', U + '/features', ({ params, body }) => {
   const r = S(body.route);
   if (!r.startsWith('/')) throw store.httpError(400, 'Route must start with /');
   const f = store.addFeature(params.pid, params.uid, { route: r, name: body.name, params: cleanParams(body.params) });
-  queueFeature(params.pid, params.uid, f.id, 'add-page', { capture: true, draft: body.draft !== false, explore: !!body.explore });
+  queueFeature(params.pid, params.uid, f.id, 'add-page', { capture: true, draft: body.draft !== false, explore: !!body.explore, supervise: !!body.supervise });
   return { id: f.id };
 });
 
@@ -168,6 +156,7 @@ route('PATCH', U + '/features/:fid', ({ params, body }) => {
     if (body.status !== undefined) {
       if (!STATUSES.includes(body.status)) throw store.httpError(400, 'Bad status');
       x.status = body.status;
+      x.statusBy = 'user';
     }
     if (body.name !== undefined) {
       const n = cleanPair(body.name);
@@ -182,6 +171,13 @@ route('PATCH', U + '/features/:fid', ({ params, body }) => {
       x.route = r;
     }
     if (body.params !== undefined) x.params = cleanParams(body.params);
+    if (body.alias !== undefined && body.alias && typeof body.alias === 'object') {
+      const alias = {};
+      Object.keys(body.alias).forEach((k) => {
+        if (/^[A-Za-z0-9_]{1,40}$/.test(k) && /^[a-z][a-z0-9_]{0,38}$/.test(S(body.alias[k]))) alias[k] = S(body.alias[k]);
+      });
+      x.alias = alias;
+    }
     if (body.waitFor !== undefined) x.waitFor = S(body.waitFor);
     if (Array.isArray(body.steps)) {
       x.actions = body.steps.map(S).filter(Boolean).map((click) => ({ click }));
@@ -202,7 +198,7 @@ route('DELETE', U + '/features/:fid', ({ params }) => {
 
 route('POST', U + '/features/:fid/recapture', ({ params, body }) => {
   needFeature(params.pid, params.uid, params.fid);
-  const job = queueFeature(params.pid, params.uid, params.fid, 'capture', { capture: true, draft: !!body.draft, explore: !!body.explore });
+  const job = queueFeature(params.pid, params.uid, params.fid, 'capture', { capture: true, draft: !!body.draft, explore: !!body.explore, supervise: !!body.supervise });
   return { jobId: job.id };
 });
 
@@ -220,7 +216,7 @@ route('POST', U + '/discover', ({ params, body }) => {
     type: 'discover',
     pid: params.pid,
     uid: params.uid,
-    run: (log) => pipeline.discover(params.pid, params.uid, { draft: body.draft !== false, explore: !!body.explore }, log),
+    run: (log) => pipeline.discover(params.pid, params.uid, { draft: body.draft !== false, explore: !!body.explore, supervise: !!body.supervise }, log),
   });
   return { jobId: job.id };
 });
@@ -233,7 +229,7 @@ route('POST', U + '/restart', ({ params, body }) => {
     type: 'restart',
     pid: params.pid,
     uid: params.uid,
-    run: (log) => pipeline.restart(params.pid, params.uid, { draft: body.draft !== false, explore: !!body.explore }, log),
+    run: (log) => pipeline.restart(params.pid, params.uid, { draft: body.draft !== false, explore: !!body.explore, supervise: !!body.supervise }, log),
   });
   return { jobId: job.id };
 });
@@ -247,7 +243,10 @@ route('POST', U + '/draft-all', ({ params, body }) => {
     type: 'draft-all',
     pid: params.pid,
     uid: params.uid,
-    run: (log) => pipeline.draftMany(params.pid, params.uid, scope, log),
+    run: async (log) => {
+      await pipeline.draftMany(params.pid, params.uid, scope, log);
+      if (body.supervise) await supervisor.runPass(params.pid, params.uid, { log, act: true });
+    },
   });
   return { jobId: job.id };
 });
@@ -310,6 +309,60 @@ route('POST', U + '/generate', ({ params, body }) => {
     run: (log) => pipeline.generate(params.pid, params.uid, { formats, langs, force: !!body.force }, log),
   });
   return { jobId: job.id };
+});
+
+route('POST', '/api/detect-login', async ({ body }) => {
+  const appUrl = S(body.appUrl);
+  if (!/^https?:\/\//.test(appUrl)) throw store.httpError(400, 'App URL must start with http:// or https://');
+  const loginPath = S(body.loginPath).startsWith('/') ? S(body.loginPath) : '/login';
+  try {
+    return await capture.detectLogin(appUrl.replace(/\/+$/, ''), loginPath);
+  } catch (err) {
+    throw store.httpError(422, err.message);
+  }
+});
+
+route('POST', U + '/supervise', ({ params }) => {
+  need(params.pid, params.uid);
+  const active = jobs.findActive(params.uid, 'supervise');
+  if (active) return { jobId: active.id };
+  if (!ai.status().ready) throw store.httpError(400, 'Turn on AI in .env first');
+  const job = jobs.enqueue({
+    type: 'supervise',
+    pid: params.pid,
+    uid: params.uid,
+    run: (log) => supervisor.runPass(params.pid, params.uid, { log, act: true }),
+  });
+  return { jobId: job.id };
+});
+
+route('GET', U + '/assistant', ({ params }) => {
+  need(params.pid, params.uid);
+  return agent.getTranscript(params.pid, params.uid);
+});
+
+route('POST', U + '/assistant', ({ params, body }) => {
+  need(params.pid, params.uid);
+  if (!ai.status().ready) throw store.httpError(400, 'Turn on AI in .env first (ALLOW_CLOUD_AI and OPENROUTER_API_KEY)');
+  const job = agent.startAssistant(params.pid, params.uid, body.message);
+  return { jobId: job.id };
+});
+
+route('POST', U + '/assistant/stop', ({ params }) => {
+  need(params.pid, params.uid);
+  agent.requestStop(params.uid);
+  return { ok: true };
+});
+
+route('POST', U + '/assistant/clear', ({ params }) => {
+  need(params.pid, params.uid);
+  agent.clearConversation(params.pid, params.uid);
+  return { ok: true };
+});
+
+route('POST', U + '/assistant/confirm', async ({ params, body }) => {
+  need(params.pid, params.uid);
+  return agent.resolveConfirm(params.pid, params.uid, { entryId: String(body.entryId || ''), yes: body.yes === true });
 });
 
 route('GET', '/api/jobs', ({ query }) => jobs.listForUser(query.get('uid') || ''));
